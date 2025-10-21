@@ -1,0 +1,1 @@
+.\.venv\Scripts\pyside6-rcc.exe resources\resources.qrc -o src\resources_rc.py

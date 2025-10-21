@@ -1,0 +1,7 @@
+-- para instalar el design
+.venv\Scripts\activate
+pip install pyside6 pyside6-addons
+
+--para abrir el design
+.venv\Scripts\activate
+pyside6-designer
