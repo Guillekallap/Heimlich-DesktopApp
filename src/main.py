@@ -59,14 +59,36 @@ class CameraApp(QMainWindow):
 
     def post_request(self,image: str):
         payload = {"image": image}  # se pasa una imagen al request
-        print("Enviando request al servidor:")
-        r = requests.post("http://127.0.0.1:8000/predictOne", json=payload, timeout=120)
+        print("Enviando request al servidor.")
+        try:
+            r = requests.post("http://127.0.0.1:8000/predictOne", json=payload, timeout=120)
 
-        data = r.json()
+        except requests.RequestException as e:
+            # Error de red / timeout
+            print(f"[POST] Error de red: {e}")
+            return {"error": str(e)}
+
+        try:
+            data = r.json()
+
+        except ValueError:
+            # No era JSON
+            return {"error": "Respuesta no es JSON", "raw": r.text}
+
+        if not r.ok:
+            # FastAPI suele usar {"detail": ...}
+            return {"error": "HTTP error", "status": r.status_code, "detail": data.get("detail", data)}
 
         prediction = data["prediction"]
+
+        if prediction is None:
+            # No vino 'prediction'; devuelve lo que vino para depurar
+            return {"error": "Campo 'prediction' ausente", "data": data}
+
         print("Resultado de prediccion:",prediction)
         return prediction
+
+
 
     def set_icon_result(self,result: str):
         if result == "correcta":
@@ -85,12 +107,26 @@ class CameraApp(QMainWindow):
             print("No se pudo codificar el frame.")
             return
 
-        print("Captura de foto")
+        print("Captura de foto.")
 
         b64_str = base64.b64encode(buf.tobytes()).decode("utf-8")
 
         result = self.post_request(b64_str)
 
+        if "error" in result:
+            print(f"[PREDICT] Error: {result['error']}")
+            if "status" in result:
+                print(f"[PREDICT] HTTP status: {result['status']}")
+            if "detail" in result:
+                print(f"[PREDICT] detail: {result['detail']}")
+            # opcional: mostrar un ícono de error en la UI
+            return
+
+        pred = result["prediction"]
+        avg = result.get("average")
+        print(f"[PREDICT] prediction={pred}, average={avg}")
+
+        # agrega el icono de correcto o incorrecto
         self.set_icon_result(result)
 
 
