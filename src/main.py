@@ -3,6 +3,8 @@ import sys
 import cv2
 import base64, requests, json
 import resources_rc
+# Referencia explícita para evitar warnings de linter; resources se registran al importarlos
+_ = resources_rc
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage, QPixmap
@@ -10,6 +12,9 @@ from PySide6.QtUiTools import QUiLoader
 from PySide6.QtCore import QFile, QIODevice
 from pathlib import Path
 from PySide6.QtCore import Qt
+import time
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QDialog, QPushButton
+import os
 
 
 def load_ui(path):
@@ -25,9 +30,14 @@ class CameraApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        base_dir = Path(__file__).resolve().parents[1]
-        self.ui = load_ui(base_dir / "ui" / "main_window.ui")
+        # variables
+        self.total = 0
+        self.cant_ok = 0
 
+        base_dir = Path(__file__).resolve().parents[1]
+        self.base_dir = base_dir
+        self.ui = load_ui(base_dir / "ui" / "main_window.ui")
+        self.pop_up = base_dir / "ui" /"popup_window.ui"
         # Buscar el QLabel del .ui
         self.label: QLabel = self.ui.findChild(QLabel, "lblCamera")
 
@@ -37,27 +47,157 @@ class CameraApp(QMainWindow):
         # Imagen correcta
         self.correcto_icon = QPixmap(":/icons/correcto.png")
         self.correcto_icon = self.correcto_icon.scaled(self.lbl_result.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.lbl_result.setPixmap(self.correcto_icon)
 
         #imagen error
         self.error_icon = QPixmap(":/icons/error.png")
         self.error_icon = self.error_icon.scaled(self.lbl_result.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
         # Inicializar la cámara (0 = webcam principal)
         self.cap = cv2.VideoCapture(0)
+
+        # guardar último frame
+        self.last_frame_bgr = None
 
         # Crear un QTimer que actualice el frame cada 30 ms
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
 
-        # Timer de captura cada 3 segundos
+        # Timer de captura cada 3 segundos (no arrancar aquí; sólo durante la sesión)
         self.capture_timer = QTimer()
         self.capture_timer.timeout.connect(self.capture_to_base64)
-        self.capture_timer.start(3000)
+
+        # Timer de sesión (11 segundos) - se crea pero se arranca en start_session
+        self.session_timer = QTimer()
+        self.session_timer.setSingleShot(True)
+        # cuando expire, primero detener capture_timer y luego finalizar la sesión (evita captura en t~fin)
+        self.session_timer.timeout.connect(self.session_expired)
+
+        # Estado de sesión y almacenamiento
+        self.session_active = False
+        self.session_dir = None
+        self.session_images = []           # lista de rutas de archivos guardados en la sesión
+        self.session_predictions = {}      # mapa ruta -> prediction
+
+        # Conectar botón "Comenzar" que en la UI se llama btnComenzar
+        try:
+            from PySide6.QtWidgets import QPushButton
+            btn_start = self.ui.findChild(QPushButton, "btnComenzar")
+            if btn_start:
+                btn_start.clicked.connect(self.start_session)
+            # Conectar botón reiniciar (si existe)
+            btn_restart = self.ui.findChild(QPushButton, "btnReiniciar")
+            if btn_restart:
+                btn_restart.clicked.connect(self.restart_camera)
+        except Exception:
+            # si no existe el botón en la UI, no hacer nada (puede llamarse start_session manualmente)
+            pass
 
         self.ui.show()
 
-    def post_request(self,image: str):
+    def log_session_error(self, message: str):
+        """Guardar mensajes de error en un archivo errors.log dentro de la sesión (no mostrar al usuario)."""
+        try:
+            if self.session_dir is not None:
+                p = self.session_dir / "errors.log"
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(f"{int(time.time())}: {message}\n")
+        except Exception as e:
+            print(f"No se pudo escribir errors.log: {e}")
+
+    def session_expired(self):
+        """Handler al expirar el timer de sesión: detener capture_timer para evitar captura en el borde, luego finalizar."""
+        print("Session timer expired: deteniendo capture_timer y finalizando sesión.")
+        try:
+            if self.capture_timer.isActive():
+                self.capture_timer.stop()
+        except Exception:
+            pass
+        # Llamar a end_session para hacer la limpieza restante
+        self.end_session()
+
+    def show_session_popup(self, proba: float):
+        """
+        Abre un popup modal usando ui/popup_window.ui.
+        Si tu popup tiene:
+          - QLabel con objectName 'lblFoto' -> muestra la última imagen correcta si existe
+          - QLabel con objectName 'lblMensaje' -> muestra un resumen corto
+          - QPushButton con objectName 'btnCerrar' -> cierra el popup
+          - QPushButton con objectName 'btnReintentar' -> reinicia la cámara/sesión
+        """
+        try:
+            # Cargar el UI del popup
+            dialog_widget = load_ui(self.pop_up)  # debe ser un QDialog en el .ui; si es QWidget, igual funciona
+            # Si la raíz no es QDialog, lo forzamos dentro de un QDialog simple
+            if not isinstance(dialog_widget, QDialog):
+                dlg = QDialog(self)
+                dialog_widget.setParent(dlg)
+                dialog_widget.setWindowFlags(dialog_widget.windowFlags() & ~Qt.Window)
+                dlg.setWindowTitle("Resultados de la sesión")
+                dlg.setModal(True)
+                dlg_layout = dlg.layout()
+                if dlg_layout is None:
+                    from PySide6.QtWidgets import QVBoxLayout
+                    dlg_layout = QVBoxLayout(dlg)
+                dlg_layout.addWidget(dialog_widget)
+                qdialog = dlg
+            else:
+                qdialog = dialog_widget
+                qdialog.setModal(True)
+
+            # Rellenar contenido dinámico si existen los widgets
+            lbl_nota = qdialog.findChild(QLabel, "lblNota")
+
+            lbl_nota.setText(f"{proba:.2f}")
+
+            # Conexión de botones si existen
+            btn_cerrar = qdialog.findChild(QPushButton, "btnCerrar")
+            if btn_cerrar:
+                btn_cerrar.clicked.connect(qdialog.accept)
+            qdialog.exec()
+        except Exception as e:
+            print(f"[POPUP] No se pudo abrir el popup: {e}")
+
+    def restart_camera(self):
+        """Reinicia la cámara y limpia la vista final para poder intentar de nuevo."""
+        print("Reiniciando cámara y limpiando vista.")
+        try:
+
+            self.total = 0
+            self.cant_ok = 0
+
+            # Si hay una sesión activa, cancelarla limpiamente
+            if self.session_timer.isActive():
+                self.session_timer.stop()
+            if self.capture_timer.isActive():
+                self.capture_timer.stop()
+            self.session_active = False
+
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+        except Exception:
+            pass
+
+        # Reabrir cámara
+        self.cap = cv2.VideoCapture(0)
+        # limpiar vistas
+        try:
+            self.label.clear()
+            self.lbl_result.clear()
+        except Exception:
+            pass
+
+        # Asegurar que la vista previa vuelve a arrancar
+        if not self.timer.isActive():
+            self.timer.start(30)
+
+        print("Cámara reiniciada.")
+
+    def post_request(self, image: str):
+        """Envía la imagen al servidor y devuelve un dict consistente.
+        En caso de éxito: {"prediction": <str>, "raw": <response-json>}.
+        En caso de error: {"error": <mensaje>, ...}.
+        """
         payload = {"image": image}  # se pasa una imagen al request
         print("Enviando request al servidor.")
         try:
@@ -79,25 +219,109 @@ class CameraApp(QMainWindow):
             # FastAPI suele usar {"detail": ...}
             return {"error": "HTTP error", "status": r.status_code, "detail": data.get("detail", data)}
 
-        prediction = data["prediction"]
+        prediction = data.get("prediction")
 
         if prediction is None:
             # No vino 'prediction'; devuelve lo que vino para depurar
             return {"error": "Campo 'prediction' ausente", "data": data}
 
-        print("Resultado de prediccion:",prediction)
-        return prediction
+        print("Resultado de prediccion:", prediction)
+        return {"prediction": prediction, "raw": data}
 
 
+    def set_icon_result(self, result: str):
 
-    def set_icon_result(self,result: str):
+        self.total += 1
+
         if result == "correcta":
             self.lbl_result.setPixmap(self.correcto_icon)
+            self.cant_ok += 1
         else:
             self.lbl_result.setPixmap(self.error_icon)
 
+    def start_session(self):
+        """Iniciar una sesión de 11 segundos: guardar fotos cada 3s y evaluar."""
+        if self.session_active:
+            print("Ya hay una sesión en curso.")
+            return
+
+        timestamp = int(time.time())
+        session_name = f"session_{timestamp}"
+        self.session_dir = self.base_dir / "captures" / session_name
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+
+        self.session_active = True
+        self.session_images = []
+        self.session_predictions = {}
+
+        # Asegurar que la cámara y timers están corriendo
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(0)
+        if not self.timer.isActive():
+            self.timer.start(30)
+        if not self.capture_timer.isActive():
+            self.capture_timer.start(30)
+
+        # Hacer una captura inmediata al iniciar la sesión (t=0)
+        try:
+            self.capture_to_base64()
+        except Exception as e:
+            print(f"Error al capturar inmediatamente: {e}")
+
+        # Iniciar timer de 12 segundos
+        self.session_timer.start(12000)
+        print(f"Sesión iniciada. Guardando en: {self.session_dir}")
+
+    def end_session(self):
+        """Finalizar sesión: detener cámara, timers y mostrar la última foto correcta (si existe)."""
+        if not self.session_active:
+            return
+
+        self.session_active = False
+        self.session_timer.stop()
+
+        # Detener captura y actualización de frames y liberar la cámara
+        if self.capture_timer.isActive():
+            self.capture_timer.stop()
+        if self.timer.isActive():
+            self.timer.stop()
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+
+        # Buscar la última imagen marcada como 'correcta'
+        last_correct = None
+        for path in reversed(self.session_images):
+            pred = self.session_predictions.get(str(path))
+            if pred == "correcta":
+                last_correct = path
+                break
+
+        if last_correct:
+            pix = QPixmap(str(last_correct))
+            pix = pix.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.label.setPixmap(pix)
+            print(f"Mostrando última foto correcta: {last_correct}")
+        else:
+            # No mostrar foto final si no hay correcta (limpiar o dejar como estaba)
+            self.label.clear()
+            print("No se encontró ninguna foto correcta en la sesión.")
+
+        print("Sesión finalizada.")
+
+        try:
+            proba = 10 * self.cant_ok / self.total
+
+            self.total = 0
+            self.cant_ok = 0
+
+            print("proba ",proba)
+        except Exception as e:
+            print(f"Error al calcular el puntaje: {e}")
+
+        self.show_session_popup(proba)
+
     def capture_to_base64(self):
-        """Toma el último frame y lo convierte a base64 (JPEG)."""
+        """Toma el último frame, lo guarda en disco si hay sesión activa, lo envía y guarda la predicción."""
         if self.last_frame_bgr is None:
             return
 
@@ -107,28 +331,56 @@ class CameraApp(QMainWindow):
             print("No se pudo codificar el frame.")
             return
 
-        print("Captura de foto.")
+        # Si hay una sesión activa, guardar la imagen en disco
+        saved_path = None
+        if self.session_active and self.session_dir is not None:
+            idx = len(self.session_images) + 1
+            filename = self.session_dir / f"frame_{idx:03d}_{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+            try:
+                with open(filename, "wb") as f:
+                    f.write(buf.tobytes())
+                saved_path = filename
+                self.session_images.append(filename)
+            except Exception as e:
+                print(f"No se pudo guardar la imagen en disco: {e}")
 
         b64_str = base64.b64encode(buf.tobytes()).decode("utf-8")
 
         result = self.post_request(b64_str)
 
-        if "error" in result:
-            print(f"[PREDICT] Error: {result['error']}")
-            if "status" in result:
-                print(f"[PREDICT] HTTP status: {result['status']}")
-            if "detail" in result:
-                print(f"[PREDICT] detail: {result['detail']}")
-            # opcional: mostrar un ícono de error en la UI
+        # Manejar errores del post_request
+        if isinstance(result, dict) and "error" in result:
+            # Registrar error para revisar luego (no mostrar al usuario)
+            err_msg = result.get("error")
+            print(f"[PREDICT] Error: {err_msg}")
+            # registrar en archivo de la sesión
+            try:
+                self.log_session_error(str(err_msg))
+            except Exception:
+                pass
+            # marcar la predicción como error si se guardó la imagen
+            if saved_path is not None:
+                self.session_predictions[str(saved_path)] = f"ERROR: {err_msg}"
             return
 
-        pred = result["prediction"]
-        avg = result.get("average")
-        print(f"[PREDICT] prediction={pred}, average={avg}")
+        # extraer prediction en los distintos formatos posibles
+        prediction = None
+        if isinstance(result, dict) and "prediction" in result:
+            prediction = result["prediction"]
+        elif isinstance(result, str):
+            prediction = result
+        else:
+            print(f"[PREDICT] formato inesperado: {result}")
+            return
 
-        # agrega el icono de correcto o incorrecto
-        self.set_icon_result(result)
+        print(f"[PREDICT] prediction={prediction}")
 
+        # guardar la predicción asociada al archivo si fue guardado
+        if saved_path is not None:
+            self.session_predictions[str(saved_path)] = prediction
+
+        # Actualizar el ícono de resultado
+        self.set_icon_result(prediction)
 
 
     def update_frame(self):
@@ -145,7 +397,21 @@ class CameraApp(QMainWindow):
 
     def closeEvent(self, event):
         """Cerrar cámara al cerrar la app"""
-        self.cap.release()
+        try:
+            if self.capture_timer.isActive():
+                self.capture_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self.timer.isActive():
+                self.timer.stop()
+        except Exception:
+            pass
+        try:
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+        except Exception:
+            pass
         event.accept()
 
 
